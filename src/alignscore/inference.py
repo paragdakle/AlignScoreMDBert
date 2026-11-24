@@ -8,10 +8,11 @@ import torch.nn as nn
 from tqdm import tqdm
 
 class Inferencer():
-    def __init__(self, ckpt_path, model='bert-base-uncased', batch_size=32, device='cuda', verbose=True) -> None:
+    def __init__(self, ckpt_path, model='bert-base-uncased', batch_size=32, device='cuda', verbose=True,
+                 max_length=None, chunk_words=None, use_bf16=None) -> None:
         self.device = device
         if ckpt_path is not None:
-            self.model = BERTAlignModel(model=model).load_from_checkpoint(checkpoint_path=ckpt_path, strict=False).to(self.device)
+            self.model = BERTAlignModel.load_from_checkpoint(checkpoint_path=ckpt_path, strict=False, map_location='cpu').to(self.device)
         else:
             warning('loading UNTRAINED model!')
             self.model = BERTAlignModel(model=model).to(self.device)
@@ -20,7 +21,17 @@ class Inferencer():
 
         self.config = AutoConfig.from_pretrained(model)
         self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.spacy = spacy.load('en_core_web_sm')
+        self._spacy = None
+
+        # Long-context backbones (ModernBERT: 8192) see whole documents; RoBERTa keeps its 512 limit.
+        model_max = min(int(self.tokenizer.model_max_length), int(getattr(self.config, 'max_position_embeddings', 512)))
+        self.max_length = int(max_length or model_max)
+        # words per context chunk for the *_sp modes: 350 for 512-token models (original AlignScore),
+        # scaled to the window for long-context models (~1.4 tokens/word, room left for the claim).
+        self.chunk_words = int(chunk_words or (350 if self.max_length <= 512 else max(350, int((self.max_length - 256) / 1.4))))
+        if use_bf16 is None:
+            use_bf16 = str(device).startswith('cuda') and getattr(self.model, 'is_modernbert', False)
+        self.use_bf16 = bool(use_bf16)
 
         self.loss_fct = nn.CrossEntropyLoss(reduction='none')
         self.softmax = nn.Softmax(dim=-1)
@@ -66,7 +77,7 @@ class Inferencer():
         premise_sents = sent_tokenize(premise)
         premise_sents = premise_sents or ['']
 
-        n_chunk = len(premise.strip().split()) // 350 + 1
+        n_chunk = len(premise.strip().split()) // self.chunk_words + 1
         n_chunk = max(len(premise_sents) // n_chunk, 1)
         premise_sents = [each for each in chunks(premise_sents, n_chunk)]
 
@@ -107,18 +118,22 @@ class Inferencer():
             premise = [premise]
             hypo = [hypo]
         
-        batch = self.batch_tokenize(premise, hypo)
+        # sort by length so each mini-batch is padded only to its own longest pair, then restore order
+        order = sorted(range(len(premise)), key=lambda i: len(premise[i]) + len(hypo[i]), reverse=True)
+        restore = torch.empty(len(order), dtype=torch.long)
+        restore[torch.tensor(order, dtype=torch.long)] = torch.arange(len(order))
+        batch = self.batch_tokenize([premise[i] for i in order], [hypo[i] for i in order])
         output_score_reg = []
         output_score_bin = []
         output_score_tri = []
 
         for mini_batch in tqdm(batch, desc="Evaluating", disable=not self.verbose or self.disable_progress_bar_in_inference):
             mini_batch = mini_batch.to(self.device)
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_bf16):
                 model_output = self.model(mini_batch)
-                model_output_reg = model_output.reg_label_logits.cpu()
-                model_output_bin = model_output.seq_relationship_logits # Temperature Scaling / 2.5
-                model_output_tri = model_output.tri_label_logits
+                model_output_reg = model_output.reg_label_logits.float().cpu()
+                model_output_bin = model_output.seq_relationship_logits.float() # Temperature Scaling / 2.5
+                model_output_tri = model_output.tri_label_logits.float()
                 
                 model_output_bin = self.softmax(model_output_bin).cpu()
                 model_output_tri = self.softmax(model_output_tri).cpu()
@@ -126,9 +141,9 @@ class Inferencer():
             output_score_bin.append(model_output_bin[:,1])
             output_score_tri.append(model_output_tri[:,:])
         
-        output_score_reg = torch.cat(output_score_reg)
-        output_score_bin = torch.cat(output_score_bin)
-        output_score_tri = torch.cat(output_score_tri)
+        output_score_reg = torch.cat(output_score_reg)[restore]
+        output_score_bin = torch.cat(output_score_bin)[restore]
+        output_score_tri = torch.cat(output_score_tri)[restore]
         
         if self.nlg_eval_mode is not None:
             if self.nlg_eval_mode == 'nli':
@@ -176,10 +191,10 @@ class Inferencer():
         batch = []
         for mini_batch_pre, mini_batch_hypo in zip(self.chunks(premise, self.batch_size), self.chunks(hypo, self.batch_size)):
             try:
-                mini_batch = self.tokenizer(mini_batch_pre, mini_batch_hypo, truncation='only_first', padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt')
+                mini_batch = self.tokenizer(mini_batch_pre, mini_batch_hypo, truncation='only_first', padding='longest', pad_to_multiple_of=8, max_length=self.max_length, return_tensors='pt')
             except:
                 warning('text_b too long...')
-                mini_batch = self.tokenizer(mini_batch_pre, mini_batch_hypo, truncation=True, padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt')
+                mini_batch = self.tokenizer(mini_batch_pre, mini_batch_hypo, truncation=True, padding='longest', pad_to_multiple_of=8, max_length=self.max_length, return_tensors='pt')
             batch.append(mini_batch)
 
         return batch
@@ -203,8 +218,8 @@ class Inferencer():
         return None, torch.tensor(out_score), None
 
     def smart_l(self, premise, hypo):
-        premise_sents = [each.text for each in self.spacy(premise).sents]
-        hypo_sents = [each.text for each in self.spacy(hypo).sents]
+        premise_sents = [each.text for each in self.nlp(premise).sents]
+        hypo_sents = [each.text for each in self.nlp(hypo).sents]
 
         premise_sent_mat = []
         hypo_sents_mat = []
@@ -232,8 +247,8 @@ class Inferencer():
         ### smart-n
         n_gram = 1
 
-        premise_sents = [each.text for each in self.spacy(premise).sents]
-        hypo_sents = [each.text for each in self.spacy(hypo).sents]
+        premise_sents = [each.text for each in self.nlp(premise).sents]
+        hypo_sents = [each.text for each in self.nlp(hypo).sents]
 
         premise_sent_mat = []
         hypo_sents_mat = []
@@ -249,8 +264,8 @@ class Inferencer():
         prec = prec / (len(hypo_sents) - n_gram + 1) if (len(hypo_sents) - n_gram + 1) > 0 else 0.
 
 
-        premise_sents = [each.text for each in self.spacy(hypo).sents]# simple change
-        hypo_sents = [each.text for each in self.spacy(premise).sents]#
+        premise_sents = [each.text for each in self.nlp(hypo).sents]# simple change
+        hypo_sents = [each.text for each in self.nlp(premise).sents]#
 
         premise_sent_mat = []
         hypo_sents_mat = []
@@ -275,6 +290,12 @@ class Inferencer():
             return None, recall, None
         else:
             ValueError("SMART return type error")
+
+    @property
+    def nlp(self):
+        if self._spacy is None:
+            self._spacy = spacy.load('en_core_web_sm')
+        return self._spacy
 
     def chunks(self, lst, n):
         """Yield successive n-sized chunks from lst."""

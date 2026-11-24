@@ -152,6 +152,61 @@ python train.py --seed 2022 --batch-size 32 \
 
 `--max-samples-per-dataset`: the maximum number of samples from a dataset
 
+## Long-context training with ModernBERT
+
+`answerdotai/ModernBERT-large` (395M params, 8192-token context) can replace RoBERTa-large, which is limited to 512 tokens. The model sees whole documents instead of 350-word chunks.
+
+**Environment** (CUDA machine; needs torch ≥ 2.1, transformers ≥ 4.48, Lightning 2.x):
+```bash
+bash scripts/setup_env.sh          # venv + `pip install -e .` + spaCy/NLTK data + flash-attn when CUDA is present
+bash scripts/smoke_test.sh         # ~1 min CPU run: tiny random ModernBERT, train -> validate -> reload -> score
+```
+
+**Data.** The original mixture comes from `generate_training_data.py` → `data/training/`. Its documents are already stored untruncated, so the longer context applies to them without regenerating anything. The long-context additions come from:
+```bash
+python prepare_long_context_data.py --out data          # writes data/{training,val,test}/<name>.json
+huggingface-cli login && python prepare_long_context_data.py --only llm_aggrefact   # gated benchmark (accept terms first)
+```
+
+| name | source | task | train / val / test | median context (words) |
+|---|---|---|---|---|
+| `contract_nli` | ContractNLI, full NDAs (`tasksource/contract-nli`, `contractnli_b`) | 3-way NLI | 7191 / 1037 / 2074 | 1.5k |
+| `control_nli` | ConTRoL passage-level NLI | 3-way NLI | 6719 / 799 / 805 | 270 |
+| `wice` | WiCE: Wikipedia claims vs. cited pages | binary | 3470 / 949 / 956 | 870 |
+| `ragtruth` | RAGTruth LLM responses (QA, summary, data-to-text) | binary | 14203 / 739 / 2675 | 340 |
+| `longctx_booksum` | BookSum chapters with injected hallucinations (Liu et al. 2025) | binary | 5367 / 283 / 950 | 3.2k |
+| `quality` | QuALITY long-article multiple choice | qa | 9108 / 984 / 8344 | 4.7k |
+| `minicheck_c2d`, `minicheck_d2c` | MiniCheck synthetic data (Tang et al. 2024) | binary | 7076, 7319 / – / – | 150 |
+| `factcg_hotpot`, `factcg_musique`, `factcg_doc` | FactCG CG2C multi-hop data (Lei et al. 2025) | binary | 8213, 1042, 2068 / – / – | 130 |
+| `doc_nli` | DocNLI from HF (training file written only if missing) | binary | 861708 / 4765 / 9863 | 90 |
+| `summedits` | SummEdits, 10 domains | binary | test only: 6348 | 400 |
+| `llm_aggrefact` | LLM-AggreFact, 11 datasets (gated) | binary | dev → val / test | – |
+| `govreport` | GovReport (optional, `--with-govreport`) | summarization | train only | 9k |
+
+Val/test rows whose context also appears in any training file are dropped. For external benchmarks (LLM-AggreFact, SummEdits) they are flagged `overlaps_train` instead, so scores stay comparable to published numbers. Val splits without an official one are split by document. Rows with an empty context are removed; this drops 5.4k of FactCG's MuSiQue rows, which have blank contexts and are almost all labelled "supported".
+
+**Train:**
+```bash
+bash scripts/train_modernbert_large.sh                        # configs/modernbert_large_8k.yaml on all GPUs
+DEVICES="0 1 2 3" bash scripts/train_modernbert_large.sh --learning-rate 4e-5 --gradient-checkpointing true
+python train.py --config configs/roberta_large_baseline.yaml --devices 0 1 2 3   # original recipe, same code
+```
+What changed for ModernBERT:
+- **Batching.** Batches are length-bucketed under a per-GPU token budget (`max_tokens_per_batch`), with dynamic padding. A 30-token SNLI pair and an 8k-token contract never share a padded batch. Token counts are computed once and cached in `data/*/.length_cache/`.
+- **Model.** Training uses bf16 and FlashAttention 2 when installed (sdpa otherwise). The pooler is mean pooling (ModernBERT's own `classifier_pooling`; `--pooling cls` is available). Token type ids are not used. The MLM head only projects masked positions.
+- **Validation.** Held-out validation reports AUC and balanced accuracy per long-context set (`val_auc/<name>`) next to the multi-task `val_loss`. The best checkpoints are selected on `val_auc_mean`.
+- **Lightning 2 / DDP** replaces the removed `dp` strategy.
+
+**Evaluate** both backbones on the same long-context test sets:
+```bash
+python evaluate_long_context.py --model roberta-large --ckpt AlignScore-large.ckpt --modes nli_sp
+python evaluate_long_context.py --model answerdotai/ModernBERT-large --ckpt ckpt/modernbert-large-8k/<best>.ckpt --modes nli nli_sp
+python benchmark.py --alignscore --alignscore-model answerdotai/ModernBERT-large --alignscore-ckpt <ckpt> --alignscore-eval-mode nli_sp --alignscore-batch-size 8
+```
+`nli` scores the whole document in one pass, up to 8192 tokens. `nli_sp` keeps AlignScore's chunk/sentence aggregation, with chunks scaled to the window (about 5.7k words for ModernBERT, 350 for RoBERTa; override with `--chunk-words`). In Python, use `AlignScore(model='answerdotai/ModernBERT-large', ckpt_path=..., batch_size=8, device='cuda:0', evaluation_mode='nli')`.
+
+Caveat: about 10–25% of `longctx_booksum` chapters are longer than 8192 tokens. At training time they are truncated, so evidence near the end of a chapter can be lost.
+
 # Benchmarking
 Our benchmark includes the TRUE and SummaC benchmark as well as several popular factual consistency evaluation datasets.
 

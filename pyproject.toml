@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alignscore"
-version = "0.1.3"
+version = "0.2.0"
 authors = [
     { name = "Yuheng Zha", email = "yzha@ucsd.edu" },
     { name = "Yichi Yang", email = "yiy067@ucsd.edu" },
@@ -23,18 +23,24 @@ classifiers = [
 dependencies = [
     "spacy>=3.4.0,<4",
     "nltk>=3.7,<4",
-    "torch>=1.12.1,<2",
-    "transformers>=4.20.1,<5",
+    "torch>=2.1",
+    "transformers>=4.48",
     "tqdm>=4.64.0,<5",
-    "jsonlines>=2.0.0,<3",
-    "numpy>=1.23.1,<2",
-    "datasets>=2.3.2,<3",
+    "jsonlines>=2.0.0,<5",
+    "numpy>=1.23.1",
+    "datasets>=2.18",
+    "huggingface_hub>=0.20",
     "scikit-learn>=1.1.2,<2",
-    "pytorch_lightning>=1.7.7,<2",
+    "pytorch_lightning>=2.1",
     "scipy>=1.8.1,<2",
     "tensorboard>=2.12.0,<3",
-    "protobuf<=3.20"
+    "pyyaml>=6",
 ]
+
+[project.optional-dependencies]
+# FlashAttention 2 gives ModernBERT unpadded attention, the fastest path for long, mixed-length batches.
+# Install separately if a wheel for your CUDA/torch is not available: pip install flash-attn --no-build-isolation
+flash = ["flash-attn>=2.5"]
 
 [project.urls]
 "Homepage" = "https://github.com/yuh-zha/AlignScore"

@@ -1,0 +1,39 @@
+# AlignScore with ModernBERT-large, 8192-token context.
+# Starting point for 8x A100/H100 80GB. Tune max_tokens_per_batch to your GPU memory and
+# sweep learning_rate in {1e-5, 2e-5, 4e-5}; ModernBERT usually wants a higher LR than RoBERTa.
+model_name: answerdotai/ModernBERT-large
+tokenizer_max_length: 8192
+pooling: auto                 # ModernBERT config says "mean"; use "cls" to mimic RoBERTa's pooler
+attn_implementation: null     # auto: flash_attention_2 if flash-attn is installed, else sdpa
+gradient_checkpointing: false # set true if you raise max_tokens_per_batch or hit OOM
+
+# Batching: length-bucketed, at most `max_tokens_per_batch` padded tokens and `batch_size` sequences per GPU.
+max_tokens_per_batch: 32768
+eval_max_tokens_per_batch: 65536
+batch_size: 16
+eval_batch_size: 64
+accumulate_grad_batch: 1
+
+learning_rate: 2.0e-5
+weight_decay: 0.1
+adam_epsilon: 1.0e-6
+warm_up_proportion: 0.06
+gradient_clip_val: 1.0
+num_epoch: 3
+precision: bf16-mixed
+
+dataset_preset: alignscore+long
+data_path: data/training
+val_data_path: data/val
+max_samples_per_dataset: 500000
+max_val_samples_per_dataset: 2000
+max_train_eval_examples: 50000
+skip_missing_datasets: false
+
+val_check_interval: 0.1
+save_every_n_steps: 5000
+ckpt_save_path: ckpt/modernbert-large-8k
+log_dir: lightning_logs
+num_workers: 8
+length_workers: 16
+do_mlm: false
