@@ -177,15 +177,15 @@ def eval_summac(tasks=ALL_TASKS, summac_type='conv', device='cuda:0'):
     evaluator.evaluate()
     timer.finish(f"SummaC-{summac_type}")
 
-def eval_align_nlg(ckpt_path, comment='', base_model='roberta-large', batch_size=32, device='cuda:0', tasks=ALL_TASKS, nlg_eval_mode='nli_sp'):
-    align = Inferencer(ckpt_path=ckpt_path, model=base_model, batch_size=batch_size, device=device)
+def eval_align_nlg(ckpt_path, comment='', base_model='roberta-large', batch_size=32, device='cuda:0', tasks=ALL_TASKS, nlg_eval_mode='nli_sp', max_length=None, chunk_words=None):
+    align = Inferencer(ckpt_path=ckpt_path, model=base_model, batch_size=batch_size, device=device, max_length=max_length, chunk_words=chunk_words)
     if 'smart' in nlg_eval_mode:
         align.smart_type = nlg_eval_mode
     else:
         align.nlg_eval_mode = nlg_eval_mode
 
     evaluator = Evaluator(eval_tasks=tasks, align_func=align.nlg_eval, save_all_tables=SAVE_ALL_TABLES)
-    name = f'AlignScore-{nlg_eval_mode}-{base_model}'
+    name = f"AlignScore-{nlg_eval_mode}-{base_model.replace('/', '-')}"
     if comment:
         name += '_' + comment
     evaluator.result_save_name = f"align_eval/{name}"
@@ -222,7 +222,7 @@ def eval_chatgptshiqichen2023(api_key, chat_model='gpt-3.5-turbo', tasks=['qags_
     chatgpt = ChatGPTShiqiChen2023Scorer(task=tasks, api_key=api_key, chat_model=chat_model)
     evaluator = Evaluator(eval_tasks=tasks, align_func=chatgpt.scorer, is_save_all_tables=IS_SAVE_ALL_TABLES)
     evaluator.result_save_name = f"nlg_eval_fact/baselines/ChatGPTShiqiChen2023-{chat_model}"
-        evaluator.evaluate()
+    evaluator.evaluate()
 
 def run_benchmarks(args, argugment_error):
     os.makedirs('exp_results/baselines', exist_ok=True)
@@ -236,7 +236,10 @@ def run_benchmarks(args, argugment_error):
             ckpt_path=args.alignscore_ckpt, 
             base_model=args.alignscore_model, 
             device=args.device, tasks=args.tasks,
-            comment=args.alignscore_comment
+            comment=args.alignscore_comment,
+            batch_size=args.alignscore_batch_size,
+            max_length=args.alignscore_max_length,
+            chunk_words=args.alignscore_chunk_words,
         )
 
     if args.ctc:
@@ -338,7 +341,10 @@ if __name__ == "__main__":
 
     alignscore_parser = parser.add_argument_group('AlignScore')
     alignscore_parser.add_argument('--alignscore', action='store_true', help='Run AlignScore benchmark')
-    alignscore_parser.add_argument('--alignscore-model', type=str, choices=['roberta-base', 'roberta-large'])
+    alignscore_parser.add_argument('--alignscore-model', type=str, help="backbone, e.g. roberta-large or answerdotai/ModernBERT-large")
+    alignscore_parser.add_argument('--alignscore-batch-size', type=int, default=32)
+    alignscore_parser.add_argument('--alignscore-max-length', type=int, default=None, help='max pair tokens (default: backbone limit)')
+    alignscore_parser.add_argument('--alignscore-chunk-words', type=int, default=None, help='context chunk size in words for *_sp modes')
     alignscore_parser.add_argument('--alignscore-ckpt', type=str)
     alignscore_parser.add_argument(
         '--alignscore-eval-mode',

@@ -1,0 +1,18 @@
+# Original AlignScore-large recipe (RoBERTa-large, 512 tokens), ported to Lightning 2 / DDP.
+# Useful as a same-data baseline for the ModernBERT run (add the long-context sets via dataset_preset).
+model_name: roberta-large
+tokenizer_max_length: 512
+max_tokens_per_batch: null
+batch_size: 8               # per GPU; 8 x 4 GPUs = the original effective batch of 32
+eval_batch_size: 32
+learning_rate: 1.0e-5
+weight_decay: 0.1
+adam_epsilon: 1.0e-6
+warm_up_proportion: 0.06
+num_epoch: 3
+precision: "32"
+dataset_preset: alignscore
+data_path: data/training
+val_data_path: data/val
+ckpt_save_path: ckpt/roberta-large
+do_mlm: false
